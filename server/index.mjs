@@ -60,9 +60,16 @@ async function postWebhook(url, payload) {
   }
 }
 
-async function downloadTo(url, dest) {
+const MAX_CLIP_BYTES = Number(process.env.MAX_CLIP_MB || 300) * 1024 * 1024;
+
+async function downloadTo(url, dest, maxBytes = 0) {
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok || !res.body) throw new Error(`download ${res.status}: ${url}`);
+  // กัน volume เต็มจากไฟล์ใหญ่เกินไป (ตรวจจาก content-length ถ้าเซิร์ฟเวอร์ต้นทางส่งมา)
+  const len = Number(res.headers.get("content-length") || 0);
+  if (maxBytes > 0 && len > maxBytes) {
+    throw new Error(`file too large (${Math.round(len / 1024 / 1024)} MB > ${Math.round(maxBytes / 1024 / 1024)} MB)`);
+  }
   await pipeline(Readable.fromWeb(res.body), createWriteStream(dest));
 }
 
@@ -73,23 +80,79 @@ async function runJob(job) {
   try {
     await bundleReady;
 
-    const inputProps = {
-      slides: job.request.slides,
-      width: job.request.width,
-      height: job.request.height,
-    };
+    const compId = job.request.composition;
+    let inputProps;
 
-    // ดาวน์โหลดเสียงมาเก็บในเครื่องก่อน (Google Drive redirect ตอน render ไม่เสถียร)
-    if (job.request.audio_url) {
+    if (compId === "DramaStory") {
+      // ดาวน์โหลดคลิป/เสียงทุกช็อตมาไว้ในเครื่องก่อน (Drive/CDN ตอน render ไม่เสถียร)
       await fs.mkdir(assetDir, { recursive: true });
-      const local = path.join(assetDir, "voice.mp3");
-      await downloadTo(job.request.audio_url, local);
-      inputProps.audio_url = `http://127.0.0.1:${PORT}/assets/${job.id}/voice.mp3`;
+      const local = (name) => `http://127.0.0.1:${PORT}/assets/${job.id}/${name}`;
+      const shots = [];
+      for (const [i, s] of job.request.shots.entries()) {
+        const shot = { ...s };
+        if (s.video_url) {
+          try {
+            await downloadTo(s.video_url, path.join(assetDir, `v${i}.mp4`));
+            shot.video_url = local(`v${i}.mp4`);
+          } catch (e) {
+            console.warn(`[job ${job.id}] video ${i} download failed, fallback to image`, e?.message);
+            delete shot.video_url;
+          }
+        }
+        if (s.audio_url) {
+          await downloadTo(s.audio_url, path.join(assetDir, `a${i}.mp3`));
+          shot.audio_url = local(`a${i}.mp3`);
+        }
+        shots.push(shot);
+      }
+      inputProps = {
+        shots,
+        width: job.request.width ?? 1080,
+        height: job.request.height ?? 1920,
+      };
+      if (job.request.music_url) {
+        await downloadTo(job.request.music_url, path.join(assetDir, "music.mp3"));
+        inputProps.music_url = local("music.mp3");
+      }
+    } else {
+      await fs.mkdir(assetDir, { recursive: true });
+      const local = (name) => `http://127.0.0.1:${PORT}/assets/${job.id}/${name}`;
+
+      // ดาวน์โหลดคลิปของแต่ละสไลด์มาไว้ในเครื่องก่อน (ลิงก์ภายนอกตอน render ไม่เสถียร)
+      // ถ้าโหลดไม่ได้ จะตัดคลิปทิ้งแล้วใช้ image_url แทน และแจ้งใน warnings
+      const slides = [];
+      for (const [i, s] of job.request.slides.entries()) {
+        const slide = { ...s };
+        if (s.video_url) {
+          try {
+            await downloadTo(s.video_url, path.join(assetDir, `sv${i}.mp4`), MAX_CLIP_BYTES);
+            slide.video_url = local(`sv${i}.mp4`);
+          } catch (e) {
+            const msg = `slide ${i}: video download failed (${e?.message || e})`;
+            console.warn(`[job ${job.id}] ${msg}`);
+            job.warnings.push(msg + (s.image_url ? "; used image_url instead" : "; no image_url, slide will be blank"));
+            delete slide.video_url;
+          }
+        }
+        slides.push(slide);
+      }
+
+      inputProps = {
+        slides,
+        width: job.request.width,
+        height: job.request.height,
+      };
+
+      // ดาวน์โหลดเสียงมาเก็บในเครื่องก่อน (Google Drive redirect ตอน render ไม่เสถียร)
+      if (job.request.audio_url) {
+        await downloadTo(job.request.audio_url, path.join(assetDir, "voice.mp3"));
+        inputProps.audio_url = local("voice.mp3");
+      }
     }
 
     const composition = await selectComposition({
       serveUrl,
-      id: "DynamicStory",
+      id: compId === "DramaStory" ? "DramaStory" : "DynamicStory",
       inputProps,
     });
 
@@ -114,6 +177,7 @@ async function runJob(job) {
       job_id: job.id,
       status: "done",
       video_url: job.video_url,
+      warnings: job.warnings,
       meta: job.request.meta ?? null,
     });
   } catch (e) {
@@ -160,9 +224,12 @@ setInterval(cleanup, 6 * 3600 * 1000);
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
+// รับได้หลาย key: RENDER_API_KEY (งานเดิม) และ DRAMA_API_KEY (pipeline short drama)
+const API_KEYS = [API_KEY, process.env.DRAMA_API_KEY || ""].filter(Boolean);
+
 function auth(req, res, next) {
-  if (!API_KEY) return res.status(500).json({ error: "RENDER_API_KEY not set on server" });
-  if (req.get("x-api-key") !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+  if (API_KEYS.length === 0) return res.status(500).json({ error: "RENDER_API_KEY not set on server" });
+  if (!API_KEYS.includes(req.get("x-api-key"))) return res.status(401).json({ error: "unauthorized" });
   next();
 }
 
@@ -176,31 +243,79 @@ app.use("/assets", express.static(ASSET_DIR));
 app.post("/render", auth, (req, res) => {
   const body = req.body || {};
 
-  // Make.com บางครั้งส่ง array มาเป็น JSON string — รองรับทั้งสองแบบ
-  let slides = body.slides;
-  if (typeof slides === "string") {
-    try {
-      slides = JSON.parse(slides);
-    } catch {
-      return res.status(400).json({ error: "slides is not valid JSON" });
+  const parseArr = (v) => {
+    if (typeof v === "string") {
+      try {
+        return JSON.parse(v);
+      } catch {
+        return null;
+      }
     }
-  }
-  if (!Array.isArray(slides) || slides.length === 0) {
-    return res.status(400).json({ error: "slides must be a non-empty array" });
-  }
+    return v;
+  };
+
+  const composition = body.composition === "DramaStory" ? "DramaStory" : "DynamicStory";
   const clean = [];
-  for (const [i, s] of slides.entries()) {
-    const duration = Number(s.duration);
-    if (!s.image_url || !(duration > 0)) {
-      return res
-        .status(400)
-        .json({ error: `slide ${i}: need image_url and duration (seconds) > 0` });
+
+  if (composition === "DramaStory") {
+    const shots = parseArr(body.shots);
+    if (!Array.isArray(shots) || shots.length === 0) {
+      return res.status(400).json({ error: "shots must be a non-empty array" });
     }
-    clean.push({
-      image_url: String(s.image_url),
-      text: s.text ? String(s.text) : undefined,
-      duration,
-    });
+    for (const [i, s] of shots.entries()) {
+      if (!s.video_url && !s.image_url) {
+        return res.status(400).json({ error: `shot ${i}: need video_url or image_url` });
+      }
+      clean.push({
+        video_url: s.video_url ? String(s.video_url) : undefined,
+        image_url: s.image_url ? String(s.image_url) : undefined,
+        audio_url: s.audio_url ? String(s.audio_url) : undefined,
+        text: s.text && String(s.text).trim() !== "-" ? String(s.text) : undefined,
+        duration: Number(s.duration) > 0 ? Number(s.duration) : 4,
+      });
+    }
+  } else {
+    // Make.com บางครั้งส่ง array มาเป็น JSON string — รองรับทั้งสองแบบ
+    const slides = parseArr(body.slides);
+    if (!Array.isArray(slides) || slides.length === 0) {
+      return res.status(400).json({ error: "slides must be a non-empty array" });
+    }
+    // ค่าว่าง ("" หรือ null) จาก Make.com ถือว่าไม่ได้ส่งมา
+    const optNum = (v) => (v === undefined || v === null || v === "" ? undefined : Number(v));
+    for (const [i, s] of slides.entries()) {
+      const duration = Number(s.duration);
+      if ((!s.image_url && !s.video_url) || !(duration > 0)) {
+        return res.status(400).json({
+          error: `slide ${i}: need image_url or video_url, and duration (seconds) > 0`,
+        });
+      }
+      if (s.video_url && !/^https?:\/\//i.test(String(s.video_url))) {
+        return res.status(400).json({ error: `slide ${i}: video_url must start with http:// or https://` });
+      }
+      const video_start = optNum(s.video_start);
+      const video_end = optNum(s.video_end);
+      const video_volume = optNum(s.video_volume);
+      if (
+        (video_start !== undefined && !(video_start >= 0)) ||
+        (video_end !== undefined && !(video_end > 0)) ||
+        (video_start !== undefined && video_end !== undefined && !(video_end > video_start)) ||
+        (video_volume !== undefined && !(video_volume >= 0 && video_volume <= 1))
+      ) {
+        return res.status(400).json({
+          error: `slide ${i}: video_start >= 0, video_end > video_start, video_volume between 0 and 1`,
+        });
+      }
+      clean.push({
+        image_url: s.image_url ? String(s.image_url) : undefined,
+        video_url: s.video_url ? String(s.video_url) : undefined,
+        video_start,
+        video_end,
+        video_volume,
+        credit: s.credit ? String(s.credit) : undefined,
+        text: s.text ? String(s.text) : undefined,
+        duration,
+      });
+    }
   }
 
   const id = randomUUID();
@@ -208,9 +323,13 @@ app.post("/render", auth, (req, res) => {
     id,
     status: "queued",
     progress: 0,
+    warnings: [],
     created_at: new Date().toISOString(),
     request: {
-      slides: clean,
+      composition,
+      slides: composition === "DynamicStory" ? clean : undefined,
+      shots: composition === "DramaStory" ? clean : undefined,
+      music_url: body.music_url || undefined,
       audio_url: body.audio_url || undefined,
       webhook_url: body.webhook_url || undefined,
       width: body.width ? Number(body.width) : undefined,

@@ -66,7 +66,48 @@ Railway deploy จาก GitHub repo เป็นหลัก ขั้นตอ
 }
 ```
 ตอบกลับ `202 {job_id}` ทันที → เรนเดอร์เสร็จแล้วเซิร์ฟเวอร์ POST กลับไปที่ `webhook_url`:
-`{ job_id, status: "done", video_url, meta }` (หรือ `status: "failed"` พร้อม `error`)
+`{ job_id, status: "done", video_url, warnings, meta }` (หรือ `status: "failed"` พร้อม `error`)
 
 - ค่าเริ่มต้นเป็นวิดีโอแนวนอน 1920×1080 · ส่ง `width: 1080, height: 1920` ถ้าทำ Shorts
 - `GET /status/:id` เช็คสถานะ · `GET /health` เช็คว่าเซิร์ฟเวอร์พร้อม
+
+### สไลด์แบบคลิปวิดีโอ (แทรกคลิปที่มีสิทธิ์ใช้งาน)
+
+แต่ละสไลด์ใส่ `video_url` แทน/ร่วมกับ `image_url` ได้ (ต้องมีอย่างน้อยหนึ่งอย่าง)
+```json
+{
+  "slides": [
+    { "image_url": "https://...การ์ด.jpg", "text": "ซับ", "duration": 6 },
+    { "video_url": "https://.../clip.mp4", "video_start": 12.5, "video_end": 18,
+      "video_volume": 0, "credit": "Video: Pexels / ชื่อผู้ถ่าย",
+      "image_url": "https://...สำรอง.jpg", "text": "ซับ", "duration": 5.5 }
+  ]
+}
+```
+- `video_start` / `video_end` (วินาที) ตัดเอาเฉพาะช่วงที่ต้องการ · ไม่ใส่ = เล่นตามความยาวสไลด์
+- `video_volume` 0-1 เสียงคลิปต้นฉบับ (ค่าเริ่มต้น 0 = ปิดเสียง เพราะมีเสียงบรรยายอยู่แล้ว)
+- `credit` แสดงเป็นข้อความเล็กที่มุมซ้ายบนระหว่างสไลด์นั้น (ใช้ใส่เครดิตตามเงื่อนไขไลเซนส์)
+- ถ้าช่วงคลิปสั้นกว่า `duration` จะเห็น `image_url` (ถ้ามี) หรือฉากดำต่อจนจบสไลด์
+- เซิร์ฟเวอร์ดาวน์โหลดคลิปมาเก็บก่อนเรนเดอร์ (จำกัดขนาด `MAX_CLIP_MB`, ค่าเริ่มต้น 300) ถ้าโหลดไม่ได้จะใช้ `image_url` แทน แล้วแจ้งใน `warnings` ของ webhook และ `/status`
+- ใช้เฉพาะคลิปที่คุณมีสิทธิ์ใช้งาน (ถ่ายเอง, ไลเซนส์ฟรีเชิงพาณิชย์, Creative Commons ที่ใส่เครดิตครบ) — ไม่ควรดึงคลิปจาก YouTube/อนิเมะมาแทรก
+
+---
+
+## DramaStory (AI short drama แนวตั้ง)
+
+`POST /render` ส่ง `"composition": "DramaStory"` (header `x-api-key` ใช้ได้ทั้ง `RENDER_API_KEY` และ `DRAMA_API_KEY`)
+```json
+{
+  "composition": "DramaStory",
+  "width": 1080, "height": 1920,
+  "webhook_url": "https://hook.us2.make.com/...",
+  "shots": [
+    { "video_url": "https://cdn.leonardo.ai/...mp4", "image_url": "https://...jpg",
+      "audio_url": "https://drive.google.com/uc?id=...&export=download",
+      "text": "ซับไตเติล", "duration": 4 }
+  ]
+}
+```
+- ความยาวช็อตยืดให้พอดีกับเสียงพากย์อัตโนมัติ (+0.4 วินาที)
+- คลิปสั้นกว่าช็อต → เล่นช้าลงให้พอดี · ไม่มีคลิป → ใช้ภาพนิ่ง + ซูม
+- `text` เป็น `-` จะไม่แสดงซับ
